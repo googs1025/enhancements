@@ -121,7 +121,8 @@ notify call.
 - Summarize exhausted notification retry attempts.
 - Preserve existing successful watchdog heartbeat behavior.
 - Keep the watchdog loop non-blocking and reliable when an individual health
-  checker or systemd notification operation stalls.
+  checker or systemd notification operation stalls, while preserving enough
+  watchdog interval budget for multiple `SdNotify()` attempts.
 - Avoid new Kubernetes API, kubelet configuration, metric, event, or
   NodeCondition surface in the initial implementation.
 
@@ -134,6 +135,8 @@ notify call.
 - This KEP does not redesign kubelet health checking.
 - This KEP does not define node self-healing behavior beyond existing systemd
   watchdog behavior.
+- This KEP does not add kubelet-managed goroutine or thread dump generation on
+  watchdog failure.
 - This KEP does not dynamically disable watchdog health checks that fail or
   time out.
 - This KEP does not change the non-Linux watchdog implementation.
@@ -233,14 +236,26 @@ iteration. The same single-flight rule applies to `SdNotify()` attempts: if a
 previous notify call is still in flight, kubelet should not start another
 notify call for the current iteration.
 
+These diagnostics also depend on node-local logging making progress before the
+watchdog termination. Very high latency or stalled journal or log storage can
+delay or prevent diagnostic log persistence. Operators should correlate kubelet
+logs with systemd journal entries and, when available, core dumps or process
+stack evidence from the watchdog-triggered termination.
+
 ### Risks and Mitigations
 
 - A timeout budget that is too small could skip watchdog notifications on slow
   but healthy nodes. The timeout budget should be derived from the existing
-  watchdog notification interval instead of using a fixed global value.
+  watchdog notification interval instead of using a fixed global value, and it
+  should preserve room for at least two `SdNotify()` attempts when health
+  checks pass.
 - Wrapping blocking calls can leave goroutines running after timeout. The
   implementation must treat timeouts as diagnostic boundaries and avoid
   unbounded goroutine accumulation.
+- High-latency journal or log storage can delay or prevent default-visible
+  diagnostic logs from being persisted before systemd terminates kubelet. The
+  troubleshooting guidance should call out journal, core dump, and process
+  stack evidence as complementary sources when available.
 - Dynamically disabling a failing or timed-out watchdog health checker could
   make the watchdog loop appear healthy while hiding a real kubelet health
   problem. The initial implementation should keep failed checks visible and
@@ -302,9 +317,14 @@ current iteration.
 
 Each `SdNotify()` attempt should be run with a timeout budget derived from the
 same iteration deadline used for health checkers. Retry backoff and retry
-attempts should fit inside the remaining iteration budget. If the remaining
-budget is exhausted, kubelet should stop retrying for the current iteration and
-log an exhausted retry summary.
+attempts should fit inside the remaining iteration budget. The budget
+calculation must reserve room for at least two `SdNotify()` attempts within one
+watchdog notification interval when health checks pass. This includes the
+bounded wait for each attempt and any retry backoff between attempts. The exact
+constants should be finalized during implementation review, but the invariant is
+that one slow notification attempt must not consume the entire watchdog
+interval. If the remaining budget is exhausted, kubelet should stop retrying for
+the current iteration and log an exhausted retry summary.
 
 If `SdNotify()` returns an error, kubelet should log the returned error at a
 default-visible level and continue through the existing retry/backoff path while
@@ -578,6 +598,8 @@ This feature is kubelet-local and does not depend on apiserver or etcd.
 - `SdNotify()` can block in the systemd notify path and outlive the timeout
   wrapper.
 - Timeout budgets can be too aggressive for slow environments.
+- Very high latency or stalled node-local journal or log storage can delay or
+  prevent diagnostic logs from being persisted before watchdog termination.
 - Repeated notify failures can produce repeated default-visible logs.
 
 ###### What steps should be taken if SLOs are not being met to determine the problem?
@@ -585,6 +607,13 @@ This feature is kubelet-local and does not depend on apiserver or etcd.
 Inspect kubelet logs for structured watchdog diagnostics with
 `operation=watchdog_health_check` or `operation=watchdog_notify`. Compare those
 logs with systemd journal entries and kubelet restart timestamps.
+
+If systemd reports that kubelet was terminated by the watchdog, inspect the
+systemd journal around the failure timestamp for the watchdog termination reason
+and signal. On systems configured to preserve cores or process dumps, inspect
+the kubelet core or stack evidence to determine whether the process was
+globally blocked, blocked in logging or journald paths, blocked in systemd
+notification, or blocked in unrelated kubelet work.
 
 ## Implementation History
 
