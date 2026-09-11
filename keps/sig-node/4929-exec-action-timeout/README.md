@@ -180,11 +180,16 @@ defined by `Probe.timeoutSeconds` and KEP-1972. The kube-apiserver will reject
 non-zero `probe.exec.timeoutSeconds` values and direct users to set
 `probe.timeoutSeconds` instead.
 
-The API server validates that `timeoutSeconds` is non-negative when the
-`PodLifecycleExecActionTimeout` feature gate is enabled. When the feature gate
-is disabled on a kube-apiserver version that supports this field, new non-zero
-lifecycle hook values are not accepted. Existing pods that already have a
-non-zero value remain readable and can continue to run.
+The API server always rejects negative values. With the
+`PodLifecycleExecActionTimeout` feature gate enabled, positive values are
+accepted only for lifecycle hooks. A non-zero value under a probe `ExecAction`
+is rejected because probes use `Probe.timeoutSeconds`.
+
+When the feature gate is disabled on a kube-apiserver version that supports this
+field, a new object or update may use `timeoutSeconds: 0` or omit the field, but
+may not introduce a positive lifecycle value. An update that preserves an
+existing positive lifecycle value is allowed, and an update that clears it to
+`0` is allowed. Existing objects remain readable during rollback.
 
 ### Execution semantics
 
@@ -195,8 +200,14 @@ When kubelet executes a lifecycle hook with `exec.timeoutSeconds`:
 - `timeoutSeconds` greater than `0`: pass that duration to `RunInContainer`.
 - If the exec action times out, the lifecycle hook fails and kubelet handles
   that failure the same way it handles other lifecycle exec failures. The
-  failure message and kubelet log should make it clear that the exec action hit
-  its configured timeout.
+  failure message and kubelet log include `reason=LifecycleExecActionTimeout`
+  and the configured `timeoutSeconds`.
+
+For `postStart`, a timeout is a hook failure: kubelet records the existing
+`FailedPostStartHook` event and kills the container, as it does for other
+postStart hook failures. For `preStop`, kubelet records the existing
+`FailedPreStopHook` event and continues the existing termination flow; the
+remaining grace period is still used to stop the container.
 
 For `preStop`, the hook remains subject to the existing pod termination flow and
 grace-period cancellation. The exec timeout provides an additional
@@ -204,6 +215,11 @@ hook-specific bound when it is shorter than the remaining termination grace
 period. It does not extend the pod termination grace period; a `preStop`
 timeout value longer than the remaining grace period can still be interrupted by
 pod termination.
+
+The timeout is carried through the existing kubelet `RunInContainer` path to
+the CRI `ExecSyncRequest.timeout` field. Kubelet relies on the CRI contract for
+terminating the timed-out exec command; process-tree behavior beyond the CRI
+contract is runtime-specific and is not expanded by this KEP.
 
 ### User Stories (Optional)
 
@@ -243,15 +259,16 @@ by preserving the existing no-timeout behavior when the field is unset or `0`.
 
 Another risk is version skew between kube-apiserver and kubelet. This is
 mitigated by feature-gating the field in both components and by documenting
-that an older or disabled kubelet will ignore the field and preserve the
-existing no-timeout execution behavior.
+that an older or disabled kubelet ignores the field and preserves no-timeout
+execution. Validation must allow updates that preserve an existing positive
+value while the apiserver gate is disabled, and must allow clearing that value.
 
 ## Design Details
 
 ### Validation
 
-Validation for lifecycle `ExecAction` will be updated to reject negative
-`timeoutSeconds` values.
+Validation for lifecycle `ExecAction` rejects negative values always. Positive
+values are accepted only when `PodLifecycleExecActionTimeout` is enabled.
 
 Validation for probe `ExecAction` will reject non-zero `timeoutSeconds` values.
 This avoids introducing two timeout fields for probes:
@@ -267,9 +284,10 @@ livenessProbe:
 When the `PodLifecycleExecActionTimeout` feature gate is disabled:
 
 - new pods cannot set a non-zero lifecycle hook `exec.timeoutSeconds`;
-- updates cannot newly set a non-zero lifecycle hook `exec.timeoutSeconds`;
-- existing pods with a non-zero lifecycle hook value keep the field to avoid
-  clearing stored data during feature gate rollback.
+- updates cannot newly set a positive lifecycle hook value;
+- updates may preserve an existing positive value;
+- updates may clear an existing positive value by setting it to `0`;
+- negative values remain invalid.
 
 ### Kubelet behavior
 
@@ -285,7 +303,9 @@ If the feature gate is enabled and the value is greater than `0`, kubelet will
 pass `time.Duration(timeoutSeconds) * time.Second` to `RunInContainer`.
 
 No CRI API changes are expected. Kubelet already passes a timeout value through
-the existing exec sync path.
+the existing exec sync path. The implementation must preserve the existing
+`0`-means-no-timeout behavior and include a stable timeout reason in the
+returned lifecycle failure message and kubelet log.
 
 ### Test Plan
 
@@ -308,13 +328,17 @@ Alpha:
 - Validate that negative lifecycle exec `timeoutSeconds` values are rejected.
 - Validate that non-zero probe exec `timeoutSeconds` values are rejected and
   that probe-level `timeoutSeconds` remains valid.
-- Validate feature gate disablement behavior for create and update paths.
+- Validate feature gate disablement for create and update paths: preserve an
+  existing positive value, reject a newly introduced positive value, allow
+  clearing a positive value, and always reject negative values.
 - Test kubelet lifecycle handler passes `0` to `RunInContainer` when the field
   is unset or `0`.
 - Test kubelet lifecycle handler passes the configured timeout duration to
   `RunInContainer` when the field is positive and the feature gate is enabled.
 - Test kubelet lifecycle handler behaves as no-timeout when the feature gate is
   disabled.
+- Test timeout failures include `reason=LifecycleExecActionTimeout` and the
+  configured timeout in the returned message/log.
 
 ##### Integration tests
 
@@ -325,11 +349,11 @@ N/A for alpha.
 Alpha:
 
 - Create a pod with a `postStart` exec hook that blocks longer than
-  `timeoutSeconds`; verify the hook times out and the container is handled as a
-  failed lifecycle hook.
+  `timeoutSeconds`; verify the hook times out, emits `FailedPostStartHook`, and
+  the container is killed.
 - Create a pod with a `preStop` exec hook whose command sleeps longer than
-  `timeoutSeconds`; delete the pod and verify the hook does not run longer than
-  the configured timeout.
+  `timeoutSeconds`; delete the pod and verify a `FailedPreStopHook` is emitted
+  and termination continues within the remaining grace period.
 - Create a pod with an unset lifecycle exec timeout and verify behavior matches
   the pre-existing no-timeout behavior.
 
@@ -364,15 +388,16 @@ Alpha:
 
 Existing workloads are not changed during upgrade. Users who enable the feature
 gate can start setting `exec.timeoutSeconds` on lifecycle hooks. Workloads that
-do not set the field continue to run with the current no-timeout behavior.
+do not set the field continue to run with the current no-timeout behavior. The
+feature must be enabled in both kube-apiserver and kubelet before ordinary API
+workloads can use it.
 
 #### Downgrade
 
 If the feature gate is disabled on a kube-apiserver version that supports this
-field, new pods cannot set non-zero lifecycle exec timeouts. Existing pods that
-already contain the field remain stored and readable, and updates are allowed to
-preserve the old value without newly enabling the feature on objects that did
-not already use it.
+field, new pods cannot set positive lifecycle exec timeouts. Existing pods that
+already contain the field remain stored and readable; updates may preserve the
+old value or clear it to `0`, but may not newly introduce a positive value.
 
 If kube-apiserver is downgraded to a version that does not know the field,
 existing pods continue to run on kubelets that have already observed them.
@@ -380,8 +405,9 @@ Updates through the older kube-apiserver may reject or drop the new field
 according to that version's API decoding and validation behavior. Users should
 remove non-zero lifecycle exec timeouts before downgrading the control plane.
 
-If kubelet is downgraded or the feature gate is disabled, kubelet ignores the
-field and lifecycle exec hooks run with the existing no-timeout behavior.
+If kubelet is downgraded or its feature gate is disabled, kubelet ignores the
+field and lifecycle exec hooks run with the existing no-timeout behavior. This
+means a rollback can make an existing timeout-bearing hook run longer again.
 
 ### Version Skew Strategy
 
@@ -393,7 +419,7 @@ accept pods with lifecycle exec timeouts, but the kubelet ignores the timeout
 and preserves existing no-timeout behavior.
 
 If kubelet enables the feature but kube-apiserver does not, ordinary pods cannot
-set non-zero lifecycle exec timeouts through the API server. Static pods on that
+set positive lifecycle exec timeouts through the API server. Static pods on that
 kubelet can use the field if the kubelet understands it and the feature gate is
 enabled.
 
