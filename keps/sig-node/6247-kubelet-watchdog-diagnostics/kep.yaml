@@ -24,10 +24,4 @@ milestone:
   beta: ""
   stable: ""
 
-feature-gates:
-  - name: KubeletWatchdogDiagnostics
-    components:
-      - kubelet
-disable-supported: true
-
 metrics: []

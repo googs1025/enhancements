@@ -16,10 +16,9 @@
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
   - [Current kubelet watchdog flow](#current-kubelet-watchdog-flow)
-  - [Bounded health checker execution](#bounded-health-checker-execution)
-  - [Bounded systemd notification](#bounded-systemd-notification)
+  - [Health checker failure logging](#health-checker-failure-logging)
+  - [Notification failure logging](#notification-failure-logging)
   - [Structured diagnostic logs](#structured-diagnostic-logs)
-  - [Feature gate](#feature-gate)
   - [Test Plan](#test-plan)
     - [Prerequisite testing updates](#prerequisite-testing-updates)
     - [Unit tests](#unit-tests)
@@ -41,419 +40,224 @@
 - [Implementation History](#implementation-history)
 - [Drawbacks](#drawbacks)
 - [Alternatives](#alternatives)
-  - [Only raise <code>SdNotify()</code> error log visibility](#only-raise-sdnotify-error-log-visibility)
-  - [Add kubelet configuration for watchdog timeout budgets](#add-kubelet-configuration-for-watchdog-timeout-budgets)
-  - [Only wrap <code>SdNotify()</code> outside the source library](#only-wrap-sdnotify-outside-the-source-library)
-  - [Add metrics or events](#add-metrics-or-events)
+  - [Timeout and cancellation](#timeout-and-cancellation)
+  - [Metrics, events, or NPD](#metrics-events-or-npd)
 - [Infrastructure Needed](#infrastructure-needed)
 <!-- /toc -->
 
 ## Release Signoff Checklist
 
-Items marked with (R) are required *prior to targeting to a milestone / release*.
+Items marked with (R) are required prior to targeting a milestone or release.
 
-- [ ] (R) Enhancement issue in release milestone, which links to KEP dir in
-  [kubernetes/enhancements] (not the initial KEP PR)
-- [ ] (R) KEP approvers have approved the KEP status as `implementable`
-- [ ] (R) Design details are appropriately documented
-- [ ] (R) Test plan is in place, giving consideration to SIG Architecture and
-  SIG Testing input (including test refactors)
-  - [ ] e2e Tests for all Beta API Operations (endpoints)
-  - [ ] (R) Ensure GA e2e tests meet requirements for
-    [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md)
-    within one minor version of promotion to GA
-  - [ ] (R) Minimum Two Week Window for GA e2e tests to prove flake free
-- [ ] (R) Graduation criteria is in place
-  - [ ] (R) [all GA Endpoints](https://github.com/kubernetes/community/pull/1806)
-    must be hit by
-    [Conformance Tests](https://github.com/kubernetes/community/blob/master/contributors/devel/sig-architecture/conformance-tests.md)
-    within one minor version of promotion to GA
-- [ ] (R) Production readiness review completed
-- [ ] (R) Production readiness review approved
-- [ ] "Implementation History" section is up-to-date for milestone
-- [ ] User-facing documentation has been created in [kubernetes/website], for
-  publication to [kubernetes.io]
-- [ ] Supporting documentation--e.g., additional design documents, links to
-  mailing list discussions/SIG meetings, relevant PRs/issues, release notes
-
-[kubernetes.io]: https://kubernetes.io/
-[kubernetes/enhancements]: https://git.k8s.io/enhancements
-[kubernetes/kubernetes]: https://git.k8s.io/kubernetes
-[kubernetes/website]: https://git.k8s.io/website
+- [ ] (R) Enhancement issue is in the release milestone and links to this KEP.
+- [ ] (R) KEP approvers have approved status `implementable`.
+- [ ] (R) Design details and test plan are documented.
+- [ ] (R) Graduation criteria are documented.
+- [ ] (R) Production readiness review is completed and approved.
+- [ ] Implementation History and supporting documentation are up to date.
 
 ## Summary
 
-Kubelet can integrate with systemd watchdog on Linux nodes. When enabled,
-kubelet periodically runs watchdog health checks and sends a heartbeat to
-systemd through `SdNotify()`. If heartbeats stop, systemd can restart kubelet.
+On Linux nodes, kubelet can use the systemd watchdog. It periodically runs
+health checkers and sends a heartbeat through `SdNotify()`. If heartbeats stop,
+systemd can restart kubelet.
 
-Today, operators may see the eventual watchdog-triggered kubelet restart without
-enough pre-restart evidence to identify why heartbeats stopped. A watchdog
-health checker might have returned an error, a checker might have stalled,
-`SdNotify()` might have returned an error, or the systemd notification path
-might have blocked. The current diagnostics do not make these cases easy to
-distinguish.
-
-This KEP proposes bounded diagnostic guardrails for kubelet's existing systemd
-watchdog path. The change adds bounded waits for watchdog health checks and
-systemd notification calls, default-visible structured logs for failure paths,
-and retry summary logging when notification retries are exhausted.
+This KEP makes existing watchdog failures easier to diagnose. It adds
+default-visible structured logs for checker errors and `SdNotify()` errors, plus
+one summary when existing notification retries are exhausted. It does not
+change watchdog execution, timing, retry count, socket behavior, or cancellation.
 
 ## Motivation
 
-The systemd watchdog integration is meant to help recover from an unhealthy
-kubelet, but a watchdog-triggered restart is difficult to investigate if kubelet
-does not leave enough diagnostic information before it stops sending
-heartbeats. This increases time to recovery for node operators and makes it hard
-to distinguish kubelet health-check problems from systemd notification problems.
-
-Bounded diagnostics provide root-cause hints before systemd restarts kubelet.
-Operators should be able to answer whether kubelet skipped a heartbeat because
-of a failed checker, a stalled checker, a returned notify error, or a blocked
-notify call.
+A watchdog-triggered kubelet restart can currently leave insufficient evidence
+to distinguish a checker error from a notification error. The existing retry
+path also does not provide a concise default-visible summary after all attempts
+fail.
 
 ### Goals
 
-- Identify failed watchdog health checkers by name.
-- Identify watchdog health checkers that exceed their timeout budget.
-- Identify `SdNotify()` calls that return errors at default-visible log levels.
-- Identify `SdNotify()` calls that exceed their timeout budget.
-- Summarize exhausted notification retry attempts.
-- Preserve existing successful watchdog heartbeat behavior.
-- Keep the watchdog loop non-blocking and reliable when an individual health
-  checker or systemd notification operation stalls, while preserving enough
-  watchdog interval budget for multiple `SdNotify()` attempts.
-- Avoid new Kubernetes API, kubelet configuration, metric, event, or
-  NodeCondition surface in the initial implementation.
+- Identify failed watchdog health checkers by name and error.
+- Make returned `SdNotify()` errors visible at the default log level.
+- Summarize exhausted notification retries.
+- Preserve existing successful heartbeat and failure behavior.
+- Keep the change small and kubelet-local.
 
 ### Non-Goals
 
-- This KEP does not add kubelet configuration fields for watchdog timeout
-  budgets.
-- This KEP does not add metrics, events, or NodeConditions.
-- This KEP does not initially add Node Problem Detector integration.
-- This KEP does not redesign kubelet health checking.
-- This KEP does not define node self-healing behavior beyond existing systemd
-  watchdog behavior.
-- This KEP does not add kubelet-managed goroutine or thread dump generation on
-  watchdog failure.
-- This KEP does not dynamically disable watchdog health checks that fail or
-  time out.
-- This KEP does not change the non-Linux watchdog implementation.
-- This KEP does not guarantee forced cancellation of health checker or
-  `SdNotify()` internals that block in non-cancellable code.
+- Checker or notification timeouts.
+- Cancellation, goroutine wrappers, or socket adapters.
+- Modification or upgrade of `go-systemd`.
+- Metrics, events, NodeConditions, or Node Problem Detector integration.
+- Dynamic checker disablement, self-healing, or automatic thread dumps.
+- Changes to non-Linux watchdog behavior.
+- Diagnostics for operations that block without returning an error.
 
 ## Proposal
 
-Enhance kubelet's Linux systemd watchdog loop with internal diagnostic
-guardrails:
+Keep the existing watchdog control flow and add diagnostics at existing failure
+points:
 
-- Run watchdog health checkers with bounded wait time.
-- Treat a health checker timeout as a watchdog health check failure for the
-  current iteration.
-- Call `SdNotify()` with bounded wait time.
-- Treat a notify timeout as a failed notification attempt for the current
-  iteration.
-- Log `SdNotify()` returned errors at a default-visible level.
-- Preserve existing notification retry/backoff semantics.
-- Emit a structured retry summary when notification retries are exhausted.
+1. A checker error logs its name and error at the default level, then preserves
+   the existing fail-fast behavior.
+2. An `SdNotify()` error logs at the default level, then preserves the existing
+   retry and backoff behavior.
+3. Exhausted retries emit one structured summary with the attempt count and
+   final error/result.
 
-This proposal is intentionally internal to kubelet. It does not add new API
-surface and does not change how users enable systemd watchdog.
-
-The alpha implementation is guarded by the `KubeletWatchdogDiagnostics`
-kubelet feature gate. The gate gives SIG Node and operators a rollback switch
-while timeout budgets and log volume are validated.
-
-During implementation, kubelet should evaluate whether the underlying
-`SdNotify()` path can accept cancellation directly. If the current source
-library cannot support context-aware notification calls, the implementation may
-need a small library contribution or kubelet-local adapter. This KEP does not
-require a broad redesign of the notification library, but it should not assume
-that a goroutine wrapper is the only viable implementation.
+No feature gate is proposed because this change only increases failure-log
+visibility and adds a summary. It does not change watchdog behavior.
 
 ### User Stories
 
 #### Story 1: Triage watchdog-triggered kubelet restarts
 
-A cluster operator receives an alert that kubelet restarted on a node, for
-example from existing process restart monitoring or systemd journal entries. The
-operator checks the normal kubelet logs around the restart timestamp and finds a
-structured watchdog diagnostic entry. The entry indicates whether the last
-watchdog iteration failed because a health checker returned an error, a checker
-timed out, `SdNotify()` returned an error, or notification retries were
-exhausted. The operator uses that evidence to decide whether to investigate
-kubelet health, node-local systemd notification delivery, or a failing watchdog
-checker.
+An operator detects a kubelet restart from existing process or systemd
+monitoring, checks kubelet logs and the systemd journal, and finds a structured
+entry identifying a failed checker, notification error, or exhausted retries.
 
 #### Story 2: Preserve evidence at default log levels
 
-An on-call SRE investigates a watchdog-triggered kubelet restart after the node
-has already recovered. The SRE only has the default kubelet logs collected from
-the affected node and cannot reproduce the failure with higher verbosity. The
-SRE finds default-visible watchdog failure logs with stable fields such as the
-operation, elapsed time, timeout budget, retry attempt, and returned error when
-available. Those fields let the SRE preserve the incident evidence and avoid
-classifying the restart only as an unexplained kubelet process restart.
+An SRE investigates a recovered node using default kubelet logs and finds the
+failure entry without enabling higher verbosity. The SRE preserves the error and
+retry evidence for the incident record.
 
 #### Story 3: Separate node environment issues from kubelet health issues
 
-A node operator compares kubelet logs with systemd journal entries after a
-watchdog restart. If kubelet reports a watchdog health-check failure, the
-operator investigates kubelet internals and the failing checker. If kubelet
-reports `SdNotify()` errors, notification timeouts, or exhausted notification
-retries, the operator investigates node-local systemd notification delivery
-instead. The diagnostic distinction reduces the chance of misdiagnosing a node
-environment problem as a kubelet health problem, or the reverse.
+An operator compares kubelet and systemd journal entries. A named checker error
+leads to kubelet investigation; an `SdNotify()` error leads to node-local
+systemd notification investigation.
 
 #### Story 4: Investigate repeated node restarts at fleet scale
 
-A platform engineer sees repeated kubelet watchdog restarts across multiple
-nodes from existing restart-count monitoring. The engineer queries collected
-kubelet logs for the structured watchdog operation fields and groups failures by
-checker name, notify error, timeout, and retry exhaustion. This helps determine
-whether the incident is isolated to one machine, correlated with a node image or
-systemd configuration, or likely caused by broader kubelet behavior.
+A platform engineer queries externally collected kubelet logs by operation,
+checker, error, and retry summary to determine whether repeated restarts are
+isolated or correlated with a node image or systemd configuration.
 
 ### Notes/Constraints/Caveats
 
-Timeouts in this KEP are diagnostic boundaries. Go cannot safely terminate an
-arbitrary goroutine that is blocked in non-cancellable code. If a checker or
-`SdNotify()` call is wrapped with a timeout and does not return, kubelet can stop
-waiting for that operation and log the timeout, but the underlying operation may
-continue until the blocked call returns.
+This KEP does not bound or cancel a checker or notification call that blocks
+without returning. Such failures may produce no diagnostic entry and remain
+subject to existing watchdog behavior.
 
-The implementation must avoid repeatedly creating unbounded blocked goroutines
-across watchdog iterations. If the implementation uses goroutines to enforce
-bounded waits, it should avoid starting duplicate copies of an operation while a
-previous copy is still known to be in flight.
-
-Concretely, kubelet must not start another instance of the same watchdog health
-checker while its previous invocation is still in flight. If a previous
-invocation is still running at the next watchdog tick, kubelet should log that
-the checker is still in flight and treat the checker as failed for that
-iteration. The same single-flight rule applies to `SdNotify()` attempts: if a
-previous notify call is still in flight, kubelet should not start another
-notify call for the current iteration.
-
-These diagnostics also depend on node-local logging making progress before the
-watchdog termination. Very high latency or stalled journal or log storage can
-delay or prevent diagnostic log persistence. Operators should correlate kubelet
-logs with systemd journal entries and, when available, core dumps or process
-stack evidence from the watchdog-triggered termination.
+Diagnostic logs are best effort. High-latency or stalled journal/log storage may
+delay or prevent persistence before systemd terminates kubelet. Operators should
+correlate kubelet logs with the systemd journal and available core or
+process-stack evidence.
 
 ### Risks and Mitigations
 
-- A timeout budget that is too small could skip watchdog notifications on slow
-  but healthy nodes. The timeout budget should be derived from the existing
-  watchdog notification interval instead of using a fixed global value, and it
-  should preserve room for at least two `SdNotify()` attempts when health
-  checks pass.
-- Wrapping blocking calls can leave goroutines running after timeout. The
-  implementation must treat timeouts as diagnostic boundaries and avoid
-  unbounded goroutine accumulation.
-- High-latency journal or log storage can delay or prevent default-visible
-  diagnostic logs from being persisted before systemd terminates kubelet. The
-  troubleshooting guidance should call out journal, core dump, and process
-  stack evidence as complementary sources when available.
-- Dynamically disabling a failing or timed-out watchdog health checker could
-  make the watchdog loop appear healthy while hiding a real kubelet health
-  problem. The initial implementation should keep failed checks visible and
-  continue treating them as failed for the current watchdog iteration.
-- Default-visible notify error logs could be noisy in repeatedly failing
-  environments. The implementation should log exceptional failure and timeout
-  paths at default visibility while keeping success logs at high verbosity.
-- SIG Node may decide this does not require a KEP. The proposal is scoped so it
-  can also serve as focused implementation rationale if maintainers prefer a
-  direct PR.
+- Additional default-visible logs may be noisy during repeated failures. Use
+  stable fields and rate-limit repeated failure records.
+- The change could accidentally alter retry behavior. Tests must verify existing
+  retry count, backoff, and successful retry behavior.
+- Timeout and cancellation are intentionally deferred because they require a
+  separate lifecycle and watchdog-budget design.
 
 ## Design Details
 
 ### Current kubelet watchdog flow
 
-On Linux, kubelet creates a watchdog health checker using
-`SdWatchdogEnabled(false)`. When systemd watchdog is not enabled, kubelet does
-not start watchdog health checking. When watchdog is enabled, kubelet uses half
-of the systemd watchdog timeout as its notification interval.
+On Linux, kubelet obtains the systemd watchdog timeout and uses half of it as
+the notification interval. Each iteration runs health checkers serially. An
+error skips notification for that iteration. If all checkers pass, kubelet
+calls `SdNotify(false)` and uses the existing exponential backoff retry path.
 
-On each watchdog tick, kubelet currently:
+### Health checker failure logging
 
-1. Runs all configured watchdog health checkers serially.
-2. Skips notifying systemd if any checker returns an error.
-3. Calls `SdNotify(false)` through the watchdog client when all checkers pass.
-4. Retries notification using the existing exponential backoff path.
+When a checker returns an error, log a default-visible structured event with:
 
-The current flow does not bound each checker and does not bound the notify call.
+- `operation=watchdog_health_check`;
+- `checker=<checker name>`;
+- `result=error`;
+- the returned error.
 
-### Bounded health checker execution
+After logging, return through the existing fail-fast path. No timeout, new
+goroutine, parallel execution, or single-flight state is added.
 
-Each watchdog health checker should be run with a timeout budget derived from
-the existing watchdog notification interval. The initial implementation should
-use a single iteration deadline equal to the watchdog notification interval and
-derive per-operation budgets from that interval. For example, kubelet can divide
-the interval into slots for all registered health checkers plus one notify slot,
-then clamp each slot to a small bounded range such as one to ten seconds. The
-exact constants should be finalized during implementation review, but the
-invariant is that checker execution and notification retries for one watchdog
-tick must not consume more than the current watchdog interval.
+### Notification failure logging
 
-If a checker returns an error before the timeout, kubelet should keep the
-existing behavior of skipping the systemd notification for the current
-iteration.
+When `SdNotify()` returns an error, log a default-visible structured event with:
 
-If a checker exceeds its timeout budget, kubelet should log a structured
-diagnostic entry containing at least:
+- `operation=watchdog_notify`;
+- `attempt=<retry attempt>`;
+- `result=error`;
+- `watchdog_interval=<interval>`;
+- the returned error.
 
-- `operation`: `watchdog_health_check`
-- `checker`: the health checker name
-- `elapsed`: how long kubelet waited
-- `timeout`: the timeout budget
-- `watchdogInterval`: the watchdog notification interval
-
-A checker timeout should be treated as a failed watchdog health check for the
-current iteration.
-
-### Bounded systemd notification
-
-Each `SdNotify()` attempt should be run with a timeout budget derived from the
-same iteration deadline used for health checkers. Retry backoff and retry
-attempts should fit inside the remaining iteration budget. The budget
-calculation must reserve room for at least two `SdNotify()` attempts within one
-watchdog notification interval when health checks pass. This includes the
-bounded wait for each attempt and any retry backoff between attempts. The exact
-constants should be finalized during implementation review, but the invariant is
-that one slow notification attempt must not consume the entire watchdog
-interval. If the remaining budget is exhausted, kubelet should stop retrying for
-the current iteration and log an exhausted retry summary.
-
-If `SdNotify()` returns an error, kubelet should log the returned error at a
-default-visible level and continue through the existing retry/backoff path while
-budget remains.
-
-If `SdNotify()` does not return before the timeout budget expires, kubelet
-should log a structured diagnostic entry containing at least:
-
-- `operation`: `watchdog_notify`
-- `attempt`: the notify retry attempt
-- `elapsed`: how long kubelet waited
-- `timeout`: the timeout budget
-- `watchdogInterval`: the watchdog notification interval
-
-A notify timeout should be treated as a failed notification attempt for the
-current iteration.
+`ack=false, err=nil` retains the existing terminal unsupported behavior. A
+normal returned error retains the existing retry policy. When retries end,
+emit one summary containing the final result/error and total attempts.
 
 ### Structured diagnostic logs
 
-Failure logs should use stable structured fields so node operators can query
-logs consistently:
-
-- `operation`
-- `checker`, when applicable
-- `attempt`, when applicable
-- `elapsed`
-- `timeout`, when applicable
-- `watchdogInterval`
-- returned error, when applicable
-
-Successful watchdog notifications should remain high-verbosity logs to avoid
-increasing normal kubelet log volume.
-
-### Feature gate
-
-This KEP introduces the `KubeletWatchdogDiagnostics` kubelet feature gate.
-
-For alpha, the gate is disabled by default. When enabled, kubelet applies the
-bounded watchdog health-check execution, bounded `SdNotify()` waits,
-default-visible `SdNotify()` error logging, and exhausted retry summaries
-described in this KEP.
-
-The gate is proposed even though the enhancement does not add API surface
-because bounded waits can change watchdog failure-path behavior. A feature gate
-keeps the initial rollout reversible while SIG Node evaluates timeout budgets
-and default-visible log volume.
+Failure records use stable fields: `operation`, `checker` when applicable,
+`attempt` when applicable, `watchdog_interval`, `result`, and `error` when
+available. Success logs remain high verbosity. Repeated failures may be
+rate-limited, but the first failure in a window should be retained.
 
 ### Test Plan
 
 #### Prerequisite testing updates
 
-No prerequisite test infrastructure changes are expected.
+No prerequisite infrastructure changes are required.
 
 #### Unit tests
 
-Unit tests should cover:
+Unit tests should verify:
 
-- Watchdog disabled behavior remains unchanged.
-- `KubeletWatchdogDiagnostics=false` preserves the previous watchdog behavior.
-- Successful health checks and successful notification preserve the existing
-  heartbeat path.
-- A health checker returned error skips notification and logs the checker name.
-- A health checker timeout skips notification and logs checker name, elapsed
-  time, timeout budget, and watchdog interval.
-- A returned `SdNotify()` error is logged at a default-visible level.
-- An `SdNotify()` timeout is logged and treated as a failed notification
-  attempt.
-- Notification retries that are exhausted produce a retry summary.
-- A later successful retry after earlier failures still sends the heartbeat.
-- Non-Linux watchdog implementation remains a no-op where applicable.
+- watchdog-disabled behavior is unchanged;
+- successful checker and notification behavior is unchanged;
+- checker error logs the checker name and error at the default level;
+- checker error still skips notification and remains fail-fast;
+- notification returned errors are default-visible;
+- `ack=false, err=nil` retains terminal unsupported behavior;
+- existing retry count and backoff behavior are unchanged;
+- a later successful retry still sends the heartbeat;
+- exhausted retries emit exactly one summary with attempts and final error;
+- repeated failure records are rate-limited;
+- non-Linux watchdog behavior remains a no-op where applicable.
 
 #### Integration tests
 
-No integration tests are required for the initial implementation.
+No integration tests are required for the initial implementation. A fake
+watchdog client and test log sink cover the unchanged transport and control
+flow.
 
 #### e2e tests
 
-No e2e tests are required for the initial implementation because this KEP does
-not add Kubernetes API behavior and targets kubelet's internal systemd watchdog
-diagnostics. Unit tests with mocked watchdog clients and health checkers should
-cover the behavior.
+No e2e tests are required because this KEP adds no Kubernetes API behavior.
 
 ### Graduation Criteria
 
 #### Alpha
 
-- KEP merged as implementable.
-- Unit tests cover success, failure, timeout, retry, and disabled paths.
-- Alpha implementation merged behind `KubeletWatchdogDiagnostics`, disabled by
-  default.
-- Timeout budget constants and single-flight behavior are documented in code and
-  covered by unit tests.
+- KEP is merged as implementable.
+- Unit tests cover success, checker failure, notify failure, retry, and logging.
+- Implementation does not change watchdog execution or timing.
 
 #### Beta
 
-- SIG Node confirms the diagnostic behavior is useful after at least one alpha
-  release.
-- No unresolved reports show excessive default-visible log noise from normal
-  kubelet operation.
-- Known timeout budget issues are resolved, adjusted, or documented.
-- `KubeletWatchdogDiagnostics` is enabled by default, or SIG Node explicitly
-  decides that it should remain disabled by default for another release.
+- SIG Node confirms the diagnostics are useful after at least one alpha release.
+- No unresolved reports show unacceptable default-visible log noise.
+- Existing retry and heartbeat behavior has no regression.
 
 #### GA
 
-- The behavior has been enabled by default for at least one release without
+- Diagnostics have been enabled by default for at least one release without
   significant regressions.
-- No unresolved production-readiness concerns remain for timeout behavior or log
+- No unresolved production-readiness concerns remain for usefulness or log
   volume.
-- `KubeletWatchdogDiagnostics` is locked or removed according to Kubernetes
-  feature gate policy.
 
 ### Upgrade / Downgrade Strategy
 
-Upgrading kubelet to a version with this enhancement adds diagnostic logs on
-failure and timeout paths for nodes using systemd watchdog. Successful watchdog
-heartbeats should remain compatible.
-
-Downgrading kubelet removes the new diagnostic guardrails and returns to the
-previous watchdog behavior. No persisted state, API object, or configuration
-migration is involved.
+Upgrading kubelet adds failure diagnostics and retry summaries. Successful
+heartbeat behavior is unchanged. Downgrading kubelet removes the additional
+diagnostics. No state or configuration migration is involved.
 
 ### Version Skew Strategy
 
-This enhancement is kubelet-local. It does not require apiserver,
-controller-manager, scheduler, CRI, or kubelet-to-kubelet version coordination.
-Different nodes may run kubelet versions with or without these diagnostics, and
-different nodes may enable or disable `KubeletWatchdogDiagnostics`
-independently.
+The change is kubelet-local and requires no coordination with other components.
+Nodes may run versions with and without the additional diagnostics.
 
 ## Production Readiness Review Questionnaire
 
@@ -461,159 +265,56 @@ independently.
 
 ###### How can this feature be enabled / disabled in a live cluster?
 
-This feature is enabled by running a kubelet version that includes the
-diagnostic guardrails on a Linux node with systemd watchdog enabled and the
-`KubeletWatchdogDiagnostics` kubelet feature gate enabled.
+There is no independent feature gate. It is enabled by upgrading kubelet and
+removed by downgrading or reverting kubelet.
 
 ###### Does enabling the feature change any default behavior?
 
-It changes failure-path diagnostics for kubelet's Linux systemd watchdog path.
-Successful watchdog notification behavior should remain unchanged.
+Only failure-log visibility and retry summary content change. Watchdog timing,
+execution, retry count, and successful heartbeat behavior do not change.
 
 ###### Can the feature be disabled once it has been enabled?
 
-During alpha, disabling can be done by turning off the
-`KubeletWatchdogDiagnostics` kubelet feature gate and restarting kubelet. A full
-rollback to a kubelet version without this enhancement also removes the
-diagnostic behavior.
+Binary rollback removes the behavior; no persisted state or configuration
+migration is needed.
 
-###### What happens if we reenable the feature if it was previously rolled back?
+###### What metrics should inform a rollback?
 
-The diagnostic behavior is restored. No persisted state needs migration.
-
-###### Are there any tests for feature enablement/disablement?
-
-Unit tests should verify watchdog disabled behavior,
-`KubeletWatchdogDiagnostics=false`, and normal successful watchdog behavior
-remain unchanged.
+No new metrics are proposed. Use existing kubelet restart signals, kubelet logs,
+and systemd journal entries.
 
 ### Rollout, Upgrade and Rollback Planning
 
-###### How can a rollout or rollback fail?
-
-The most likely rollout risk is unexpectedly noisy failure logs or a timeout
-budget that is too strict for some nodes.
-
-###### What specific metrics should inform a rollback?
-
-No new metrics are proposed. Operators can use existing kubelet restart signals
-and kubelet logs to detect unexpected behavior. Node-local logs are the intended
-alpha diagnostic interface because the user story is investigation of a local
-kubelet watchdog restart, often before any cluster-level signal can be emitted.
-
-###### Were upgrade and rollback tested? Was the upgrade->downgrade->upgrade path tested?
-
-This should be covered by unit tests for compatibility paths before graduating
-beyond alpha. No persisted state or API migration is involved.
-
-###### Is the rollout accompanied by any deprecations and/or removals of features, APIs, fields of API types, flags, etc.?
-
-No.
+The main rollout risk is noisy logs in repeatedly failing environments. Unit
+tests verify compatibility because no persisted state or API migration is added.
+No deprecations or removals are introduced.
 
 ### Monitoring Requirements
 
-###### How can an operator determine if the feature is in use by workloads?
-
-This is not workload-specific. It is in use when kubelet's systemd watchdog
-integration is enabled on a Linux node running a version with this enhancement.
-
-###### How can someone using this feature know that it is working for their instance?
-
-On failure paths, kubelet logs should identify watchdog health check failures,
-health check timeouts, notify errors, notify timeouts, and exhausted notify
-retries with structured fields.
-
-###### What are the reasonable SLOs?
-
-No new SLOs are introduced. The enhancement improves diagnostic evidence for
-the existing systemd watchdog path.
-
-###### What are the SLIs an operator can use to determine the health of the service?
-
-No new SLIs are introduced. Operators can use existing kubelet process health,
-restart counts, systemd watchdog behavior, and kubelet logs.
-
-###### Are there any missing metrics that would be useful to have to improve observability of this feature?
-
-Metrics for watchdog checker timeout count or notify failure count could be
-useful in the future, but they are intentionally out of scope for the initial
-proposal to avoid expanding metric stability and label cardinality concerns.
-
-This KEP does not propose Node Problem Detector integration for alpha. The
-initial recommendation is to keep the diagnostic signal in kubelet logs because
-the first user story is local post-restart investigation using kubelet and
-systemd logs. If SIG Node finds that these diagnostics need a cluster-visible
-surface, a follow-up enhancement could evaluate whether NPD conditions, events,
-or another node-level reporting mechanism is appropriate.
+The feature is present when running a kubelet version containing the change.
+Operators can confirm the underlying watchdog setting from the kubelet systemd
+unit. Failure logs and retry summaries are the diagnostic signal. Fleet-wide
+analysis depends on external log collection; metrics, events, and NPD remain
+future options.
 
 ### Dependencies
 
-###### Does this feature depend on any specific services running in the cluster?
-
-No cluster service dependency is introduced.
-
-###### Does this feature depend on any specific services running on the node?
-
-It applies only when kubelet's systemd watchdog integration is enabled, which
-depends on systemd watchdog support on the node.
+No cluster service dependency is introduced. The change observes the existing
+systemd watchdog integration and adds no new node service dependency.
 
 ### Scalability
 
-###### Will enabling / using this feature result in any new API calls?
-
-No.
-
-###### Will enabling / using this feature result in introducing new API types?
-
-No.
-
-###### Will enabling / using this feature result in any new calls to the cloud provider?
-
-No.
-
-###### Will enabling / using this feature result in increasing size or count of the existing API objects?
-
-No.
-
-###### Will enabling / using this feature result in increasing time taken by any operations covered by existing SLIs/SLOs?
-
-No Kubernetes API operation should be affected. The watchdog loop may do small
-additional bookkeeping on failure and timeout paths.
-
-###### Will enabling / using this feature result in non-negligible increase of resource usage?
-
-The expected overhead is negligible on successful paths. Implementations that
-use goroutines for timeout handling must avoid unbounded accumulation if an
-operation remains blocked.
+No API calls, API types, cloud-provider calls, or API object data are added. No
+watchdog timing or Kubernetes operation latency changes. Extra work is limited
+to failure-path log records and one retry summary.
 
 ### Troubleshooting
 
-###### How does this feature react if the API server and/or etcd is unavailable?
-
-This feature is kubelet-local and does not depend on apiserver or etcd.
-
-###### What are other known failure modes?
-
-- A checker can block in non-cancellable code and outlive the timeout wrapper.
-- `SdNotify()` can block in the systemd notify path and outlive the timeout
-  wrapper.
-- Timeout budgets can be too aggressive for slow environments.
-- Very high latency or stalled node-local journal or log storage can delay or
-  prevent diagnostic logs from being persisted before watchdog termination.
-- Repeated notify failures can produce repeated default-visible logs.
-
-###### What steps should be taken if SLOs are not being met to determine the problem?
-
-Inspect kubelet logs for structured watchdog diagnostics with
-`operation=watchdog_health_check` or `operation=watchdog_notify`. Compare those
-logs with systemd journal entries and kubelet restart timestamps.
-
-If systemd reports that kubelet was terminated by the watchdog, inspect the
-systemd journal around the failure timestamp for the watchdog termination reason
-and signal. On systems configured to preserve cores or process dumps, inspect
-the kubelet core or stack evidence to determine whether the process was
-globally blocked, blocked in logging or journald paths, blocked in systemd
-notification, or blocked in unrelated kubelet work.
+Inspect kubelet logs and the systemd journal around the restart. If no structured
+failure record exists, inspect available core dumps or process-stack evidence;
+the failure may have occurred in a blocking operation outside this KEP. High
+latency logging storage may delay or lose records, and repeated failures may
+still produce noisy logs despite rate limiting.
 
 ## Implementation History
 
@@ -623,41 +324,23 @@ notification, or blocked in unrelated kubelet work.
 
 ## Drawbacks
 
-This change adds complexity to a small kubelet watchdog package and may require
-careful implementation to avoid goroutine accumulation after timeout. It also
-adds default-visible logs for failure paths, which can increase log volume in
-broken environments.
+The change increases default-visible log volume during failures and provides no
+additional evidence when an operation blocks without returning. Timeout and
+cancellation are intentionally left to a future proposal.
 
 ## Alternatives
 
-### Only raise `SdNotify()` error log visibility
+### Timeout and cancellation
 
-This would be the smallest change, but it would not diagnose stalled health
-checkers or blocked notify calls. Operators would still lack root-cause evidence
-for important watchdog restart cases.
+This would diagnose stalled operations, but the current checker and
+`go-systemd` interfaces do not support it. It requires a separate lifecycle,
+compatibility, and watchdog-budget design.
 
-### Add kubelet configuration for watchdog timeout budgets
+### Metrics, events, or NPD
 
-This would provide operator control, but it would add kubelet configuration API
-surface and significantly increase review scope. The initial proposal keeps
-timeouts internal and derived from the existing watchdog interval.
-
-### Only wrap `SdNotify()` outside the source library
-
-A kubelet-local wrapper around `SdNotify()` would minimize changes to
-dependencies, but it may leave blocked notification calls running until the
-underlying operation returns. During implementation, kubelet should evaluate
-whether the notification source library can support cancellation directly. A
-small context-aware library change may be preferable if it avoids lingering
-blocked notification operations without expanding this KEP into a broad library
-redesign.
-
-### Add metrics or events
-
-Metrics or events could improve fleet-level visibility, but they introduce
-metric stability, label cardinality, event reliability, and API review concerns.
-Structured logs are a smaller first step and directly support the pre-restart
-diagnostic user story.
+These could improve fleet-level visibility, but add stability, reliability,
+cardinality, and API review concerns. Structured logs are the smallest first
+step for local post-restart investigation.
 
 ## Infrastructure Needed
 
